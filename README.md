@@ -650,6 +650,18 @@ gcloud auth application-default login --impersonate-service-account="ingest-subs
 
 (You need `roles/iam.serviceAccountTokenCreator` on that service account.)
 
+> **Warning:** this replaces your Application Default Credentials for **every** tool on the machine.
+> While it is active, the Streamlit dashboard, Terraform and `publisher.py` also run as
+> `ingest-subscriber`, which can only read the bucket and load BigQuery, so an upload fails with
+> `Unable to acquire impersonated credentials` or a 403. To go back to yourself:
+>
+> ```powershell
+> gcloud auth application-default login
+> gcloud auth application-default set-quota-project $env:PROJECT_ID
+> ```
+>
+> For a first run, skip impersonation entirely and run the subscriber as yourself.
+
 ### B. Cloud Run push subscriber
 
 In **Git Bash** (the script builds with Cloud Build, so Docker is not needed locally):
@@ -667,6 +679,11 @@ and creates `file-events-push-sub` pointing at the service. Check it in PowerShe
 gcloud run services describe ingest-push --region=europe-west9 --format="value(status.url)"
 gcloud run services logs read ingest-push --region=europe-west9 --limit=20
 ```
+
+This URL is the private endpoint Pub/Sub calls. It is **not** a web front end: opening it in a
+browser returns 403. You can also find it in the console:
+<https://console.cloud.google.com/run> → your project → `ingest-push`.
+The dashboard's URL is `http://localhost:8501` (section 8.1).
 
 Running A and B together is fine for an experiment: both subscriptions receive every message,
 both try to load the file, and the deterministic BigQuery job ID makes the second one a no-op.
@@ -694,6 +711,17 @@ streamlit run dashboard\streamlit_app.py
 A browser tab opens at <http://localhost:8501>. If Streamlit asks for an email on first start, press
 Enter. If `streamlit` is "not recognized", use `py -m streamlit run dashboard\streamlit_app.py`.
 Make sure a subscriber is running (section 7), otherwise uploads stay in "waiting".
+
+**Where is the dashboard's URL?** The dashboard is not deployed anywhere. It runs on your machine,
+and Streamlit prints its address in the terminal:
+
+```
+Local URL: http://localhost:8501
+```
+
+If port 8501 is busy it uses 8502, 8503 and so on, so read the terminal. The page only exists while
+the `streamlit run` command is running, and only you can open it. To share it, you would have to
+deploy it (for example on Cloud Run behind Identity-Aware Proxy, see section 13.3).
 
 The sidebar holds the configuration (project, bucket, BigQuery location, dataset, table). It is
 pre-filled from `GCP_PROJECT`, `BUCKET` and `BQ_LOCATION`.
@@ -879,6 +907,25 @@ Everything from that point is delivered again, and the idempotent job IDs keep B
 - **Business view** (`dashboards\ingestion_queries.sql`): orders and revenue per day, top
   customers, load-job history. Use them as custom queries in Looker Studio
   (Add data → BigQuery → Custom query).
+- **BigQuery in the browser**:
+  1. Open `https://console.cloud.google.com/bigquery?project=<PROJECT_ID>` (or pick the project
+     in the top bar).
+  2. In the **Explorer** panel, expand your project → dataset `raw` → table `orders`.
+  3. Click `orders`: **Schema** shows the columns, **Details** the row count and size, **Preview**
+     the first rows (free).
+  4. To run SQL, click **Compose a new query**, paste the query below and click **Run**:
+
+     ```sql
+     SELECT * FROM `<PROJECT_ID>.raw.orders` ORDER BY created_at DESC LIMIT 100;
+     ```
+
+  5. To check whether each file loaded, open **Job history** at the bottom of the page
+     (*Personal history* or *Project history*). A failed file such as `bad_orders.csv` appears there
+     with BigQuery's error message.
+
+  If the table is missing, check the project selector and that the dataset location is `EU`. The
+  editor needs `roles/bigquery.jobUser` on the project and `roles/bigquery.dataViewer` on the
+  dataset (Owner on a sandbox covers both).
 - **Logs**: *Logs Explorer*, filter `resource.type="cloud_run_revision"` for the push service, or read
   the terminal of the local subscriber.
 
@@ -927,26 +974,158 @@ your repository. No JSON key is stored anywhere.
    The first CI run will pass the Python, static, and Terraform jobs. The CD run will fail until
    step 2 is done, which is expected.
 
-2. **Connect GCP** (run locally as project owner, in **Git Bash**)
+2. **Connect GCP** (run locally as project owner)
+
+   `GITHUB_REPO` must be exactly `owner/repo` as shown after `github.com/` (check with
+   `git remote -v`). It is case-sensitive: GCP will only trust tokens from that exact repository.
+
+   In **Git Bash**:
 
    ```bash
    PROJECT_ID=my-project GITHUB_REPO=YOUR_USER/YOUR_REPO ./scripts/bootstrap_cicd.sh
    ```
 
-   It creates the Terraform state bucket, the `github-deployer` service account with its roles, and
-   the Workload Identity pool bound to your repo, then prints the values for step 3.
+   Or from **PowerShell** (the values must be in quotes; use Git's Bash explicitly, because plain
+   `bash` on Windows may start WSL, which does not see these variables):
 
-3. **Set five repository variables** (Settings → Secrets and variables → Actions → Variables):
-   `GCP_PROJECT_ID`, `GCP_REGION`, `TF_STATE_BUCKET`, `WIF_PROVIDER`, `DEPLOYER_SA`. The script
-   prints them, with ready-to-paste `gh variable set` commands (run those in PowerShell after
-   `gh auth login`). They are not secrets.
+   ```powershell
+   $env:PROJECT_ID  = "my-project"
+   $env:GITHUB_REPO = "YOUR_USER/YOUR_REPO"
+   & "C:\Program Files\Git\bin\bash.exe" ./scripts/bootstrap_cicd.sh
+   ```
+
+   It creates the Terraform state bucket, the `github-deployer` service account with its roles, and
+   the Workload Identity pool bound to your repo, then prints the values for step 3. If you used the
+   wrong repo name, fix `GITHUB_REPO` and run it again: it is safe to re-run.
+
+3. **Set five repository variables.** These are *variables*, not secrets: none of them is sensitive.
+   The bootstrap script prints them at the end. If you lost that output, here is where each comes from:
+
+   | Variable | Value |
+   |---|---|
+   | `GCP_PROJECT_ID` | Your project ID |
+   | `GCP_REGION` | `europe-west9`, or the region you use |
+   | `TF_STATE_BUCKET` | `<project-id>-tfstate` |
+   | `DEPLOYER_SA` | `github-deployer@<project-id>.iam.gserviceaccount.com` |
+   | `WIF_PROVIDER` | The output of the command below (starts with `projects/` and a **number**) |
+
+   ```powershell
+   gcloud iam workload-identity-pools providers describe github-provider --location=global --workload-identity-pool=github-pool --format="value(name)"
+   ```
+
+   Choose one way to enter them.
+
+   **Option A: GitHub CLI (`gh`), fastest.** Install it once (it is also listed in section 4.1):
+
+   ```powershell
+   winget install --id GitHub.cli
+   ```
+
+   Close and reopen PowerShell, then check and sign in. Choose *GitHub.com*, then your preferred
+   protocol, then *Login with a web browser*:
+
+   ```powershell
+   gh --version
+   gh auth login
+   gh auth status
+   ```
+
+   Set all five variables (you need admin rights on the repository):
+
+   ```powershell
+   $R   = "YOUR_USER/YOUR_REPO"
+   $P   = $env:PROJECT_ID
+   $WIF = gcloud iam workload-identity-pools providers describe github-provider --location=global --workload-identity-pool=github-pool --format="value(name)"
+
+   gh variable set GCP_PROJECT_ID  --repo $R --body $P
+   gh variable set GCP_REGION      --repo $R --body "europe-west9"
+   gh variable set TF_STATE_BUCKET --repo $R --body "$P-tfstate"
+   gh variable set WIF_PROVIDER    --repo $R --body $WIF
+   gh variable set DEPLOYER_SA     --repo $R --body "github-deployer@$P.iam.gserviceaccount.com"
+
+   gh variable list --repo $R          # check: five variables, correct values
+   ```
+
+   The bootstrap script also prints ready-made `gh variable set` lines you can paste. Running them
+   again overwrites a value, so mistakes are easy to fix.
+
+   **Option B: browser, no installation.** On GitHub open your repository →
+   *Settings → Secrets and variables → Actions → **Variables** tab* (not Secrets) →
+   *New repository variable*, then add each name and value from the table above, five times.
+
+   Afterwards, open the **Actions** tab, select the failed CD run and click *Re-run all jobs*.
 
 4. **Add an approval gate** (recommended): Settings → Environments → New environment `production`
    → Required reviewers → add yourself. CD will pause before `terraform apply` until you approve.
 
-5. **If you already deployed manually** (Path A or B) in this project, delete those resources first
-   (section 15) or `terraform apply` will fail with "already exists". CD should be the only thing
-   that creates them.
+5. **If you already deployed manually** (Path A or B) in this project, remove those resources
+   first, or `terraform apply` in CD fails with "already exists". CD should be the only thing that
+   creates them.
+
+   **Keep** what step 2 created for CI/CD: the `<project-id>-tfstate` bucket, the `github-deployer`
+   service account and the `github-pool` Workload Identity pool. Do **not** run the CI/CD part of
+   section 15.
+
+   Run `. .\env.ps1` first so `$BUCKET` is defined, and stop the local subscriber (Ctrl+C).
+
+   **Deployed with Terraform (Path A):**
+
+   ```powershell
+   Set-Location terraform
+   terraform destroy
+   Set-Location ..
+   ```
+
+   Then delete what Terraform never managed (the Cloud Run service and its push subscription):
+
+   ```powershell
+   gcloud run services delete ingest-push --region=europe-west9 --quiet
+   gcloud pubsub subscriptions delete file-events-push-sub --quiet
+   gcloud iam service-accounts delete "pubsub-push-invoker@$($env:PROJECT_ID).iam.gserviceaccount.com" --quiet
+   ```
+
+   Finally, remove the local state so it is not mistaken for CD's remote state:
+
+   ```powershell
+   Remove-Item terraform\terraform.tfstate, terraform\terraform.tfstate.backup -ErrorAction SilentlyContinue
+   ```
+
+   **Deployed with `setup.sh` (Path B):** delete by hand:
+
+   ```powershell
+   # Bucket notification (find its number first, usually 1)
+   gcloud storage buckets notifications list "gs://$BUCKET"
+   gcloud storage buckets notifications delete "projects/_/buckets/$BUCKET/notificationConfigs/1"
+
+   # Pub/Sub
+   gcloud pubsub subscriptions delete file-events-sub file-events-push-sub file-events-dlq-sub --quiet
+   gcloud pubsub topics delete file-events file-events-dlq --quiet
+
+   # Data (deletes the loaded rows and the uploaded files)
+   bq rm -r -f -d "$($env:PROJECT_ID):raw"
+   gcloud storage rm -r "gs://$BUCKET"
+
+   # Cloud Run and identities
+   gcloud run services delete ingest-push --region=europe-west9 --quiet
+   gcloud iam service-accounts delete "ingest-subscriber@$($env:PROJECT_ID).iam.gserviceaccount.com" --quiet
+   gcloud iam service-accounts delete "pubsub-push-invoker@$($env:PROJECT_ID).iam.gserviceaccount.com" --quiet
+
+   # Monitoring dashboard (get its ID, then delete it)
+   gcloud monitoring dashboards list --format="table(name,displayName)"
+   gcloud monitoring dashboards delete <DASHBOARD_ID> --quiet
+   ```
+
+   Verify nothing is left (each command should return empty):
+
+   ```powershell
+   gcloud pubsub topics list --format="value(name)"
+   gcloud storage buckets list --format="value(name)"
+   bq ls
+   ```
+
+   **Alternative:** if you want to keep the data, import the resources into the remote state
+   instead (see "Fixing already exists by importing" in section 14). For a learning project,
+   delete and recreate is simpler.
 
 ### A change, end to end
 
@@ -1052,10 +1231,12 @@ attached service account on Cloud Run. Never commit service account JSON keys.
 | `python` opens the Microsoft Store | Use `py`, or turn off the "python" App execution aliases (section 4.1) |
 | `Activate.ps1 cannot be loaded` | Run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once |
 | `streamlit` "is not recognized" | The virtual environment is not active, or use `py -m streamlit run dashboard\streamlit_app.py` |
+| `Unable to acquire impersonated credentials` / `iam.serviceAccounts.getAccessToken` denied | Your Application Default Credentials are set to impersonate a service account (section 7A). Run `gcloud auth application-default login` again, without `--impersonate-service-account` |
 | Dashboard: "Could not create Google Cloud clients" | No credentials; run `gcloud auth application-default login` and restart Streamlit |
 | Dashboard health tab: 403 "requires a quota project" | Run `gcloud auth application-default set-quota-project $env:PROJECT_ID` |
 | Dashboard status stays "Waiting for the subscriber" | No subscriber running, wrong bucket name in the sidebar, or the notification/IAM setup is incomplete |
 | Dashboard metrics empty | Metrics lag 1 to 2 minutes; also check subscription names |
+| Opening the Cloud Run URL in a browser returns 403 | Expected: it is a private push endpoint, not a front end (section 7B). The dashboard is at `http://localhost:8501` |
 | `\r: command not found` in a `.sh` script | CRLF line endings; run `git add --renormalize .` |
 | Script works in Git Bash but `gcloud` hangs | Run the command in PowerShell instead; some interactive prompts misbehave in Git Bash's mintty |
 | Upload works, no message | Storage service agent lacks `pubsub.publisher` on the topic, or the object is not under `incoming/` |
@@ -1066,8 +1247,25 @@ attached service account on Cloud Run. Never commit service account JSON keys.
 | Reprocessing a dead letter fails again immediately | Same generation means same failed job ID; see "How to reprocess" in Test 5 |
 | Nothing reaches the DLQ | Pub/Sub agent roles from section 12 are missing |
 | Push returns 403 | `pubsub-push-invoker` lacks `run.invoker`, or the token-creator binding is missing |
-| `terraform apply` says "already exists" | Resources were created by `setup.sh` or an earlier run; delete them or import them |
+| `gh` "is not recognized" | Not installed, or the terminal was opened before installing: run `winget install --id GitHub.cli`, then close and reopen PowerShell. Or use the browser option in section 11 |
+| `terraform apply` says "already exists" (409) | The resource exists but Terraform's state does not know it (earlier run, `setup.sh`, or a second copy of the folder, since state is stored in `terraform\terraform.tfstate`). Delete the old resources (section 11, step 5) or import them, see below |
 | `PERMISSION_DENIED` / API not enabled | Re-run the `gcloud services enable` commands in 4.3 and wait a minute |
+
+**Fixing "already exists" by importing.** Tell Terraform about the existing resource, then apply again.
+Use `terraform state list` to see what it already tracks, and keep working from a single copy of the
+`terraform` folder.
+
+```powershell
+Set-Location terraform
+$P = $env:PROJECT_ID
+terraform import google_service_account.subscriber "projects/$P/serviceAccounts/ingest-subscriber@$P.iam.gserviceaccount.com"
+terraform import google_artifact_registry_repository.apps "projects/$P/locations/europe-west9/repositories/apps"
+terraform apply
+```
+
+(Change `europe-west9` if you set another `region`.) The same pattern works for other resources: the
+"Import" section of each resource's page in the Terraform Google provider documentation gives the ID
+format. If you would rather start clean, delete the leftovers and let Terraform recreate them.
 
 To peek at a message without a subscriber (stop your subscriber first, because they compete):
 
@@ -1101,14 +1299,15 @@ gcloud run services delete ingest-push --region=europe-west9 --quiet
 gcloud pubsub subscriptions delete file-events-push-sub --quiet
 gcloud iam service-accounts delete "pubsub-push-invoker@$($env:PROJECT_ID).iam.gserviceaccount.com" --quiet
 
-# CI/CD bootstrap
+# CI/CD bootstrap (skip this block if you still want CI/CD to work)
 gcloud storage rm -r "gs://$($env:PROJECT_ID)-tfstate"
 gcloud iam service-accounts delete "github-deployer@$($env:PROJECT_ID).iam.gserviceaccount.com" --quiet
 gcloud iam workload-identity-pools delete github-pool --location=global --quiet
 ```
 
 If you used `setup.sh` instead of Terraform, delete the bucket notification, subscriptions, topics,
-dataset, bucket, and the `ingest-subscriber` service account by hand.
+dataset, bucket, and the `ingest-subscriber` service account by hand (the exact commands are in
+section 11, step 5).
 
 ## Where to go next
 
