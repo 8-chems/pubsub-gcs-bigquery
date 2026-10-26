@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  pull_request:
+  workflow_call: # lets cd.yml run exactly the same checks before deploying
+
+permissions:
+  contents: read
+  id-token: write # only used by the plan job (keyless auth to GCP)
+
+jobs:
+  python:
+    name: Python lint and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            app/requirements-dev.txt
+            dashboard/requirements.txt
+      - run: pip install -r app/requirements-dev.txt -r dashboard/requirements.txt
+      - name: Lint
+        run: ruff check app dashboard
+      - name: Format check
+        run: ruff format --check app dashboard
+      - name: Unit tests (pipeline code)
+        working-directory: app
+        run: pytest -v
+      - name: Unit tests (Streamlit dashboard, headless)
+        working-directory: dashboard
+        run: pytest -v
+
+  static:
+    name: Shell, JSON and Docker checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        run: shellcheck scripts/*.sh
+      - name: Dashboard JSON is valid
+        run: python -m json.tool dashboards/pubsub-dashboard.json > /dev/null
+      - name: Docker image builds
+        run: docker build -t ingest-push:ci app
+
+  terraform:
+    name: Terraform fmt and validate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform fmt -check -recursive -diff
+      - run: terraform init -backend=false
+      - run: terraform validate
+
+  plan:
+    name: Terraform plan (pull requests only)
+    if: github.event_name == 'pull_request' && vars.WIF_PROVIDER != ''
+    needs: [terraform]
+    runs-on: ubuntu-latest
+    env:
+      TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID }}
+      TF_VAR_region: ${{ vars.GCP_REGION || 'europe-west9' }}
+      TF_VAR_enable_pull_subscription: "false"
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOYER_SA }}
+      - uses: hashicorp/setup-terraform@v3
+      - name: Use the shared remote state
+        run: |
+          cat > backend.tf <<TF
+          terraform {
+            backend "gcs" {
+              bucket = "${{ vars.TF_STATE_BUCKET }}"
+              prefix = "pubsub-pipeline"
+            }
+          }
+          TF
+      - run: terraform init
+      - run: terraform plan -no-color -lock=false

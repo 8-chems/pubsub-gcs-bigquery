@@ -1,0 +1,3 @@
+project_id = "my-project"
+# region      = "europe-west9"
+# bq_location = "EU"

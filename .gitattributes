@@ -1,0 +1,5 @@
+# Keep LF line endings so the Bash scripts and the Dockerfile work when cloned on Windows.
+*.sh       text eol=lf
+Dockerfile text eol=lf
+*.tf       text eol=lf
+*.yml      text eol=lf
